@@ -1,5 +1,10 @@
 # FreqAI strategies
 
+# 安装依赖
+```shell
+pip install optuna stable-baselines3 sb3-contrib
+```
+
 # 下载回测数据
 ```shell
 freqtrade download-data --config user_data/config-cpu.json --timerange 20240101-20250602 --timeframes 5m 15m 1h 4h 1d
