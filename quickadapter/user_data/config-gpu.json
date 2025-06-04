@@ -95,7 +95,7 @@
     "outlier_threshold": 0.999,
     "optuna_hyperopt": {
       "enabled": true,
-      "n_jobs": 6,
+      "n_jobs": 8,
       "n_trials": 36,
       "timeout": 7200,
       "candles_step": 10,
@@ -121,9 +121,7 @@
       "include_timeframes": [
         "5m",
         "15m",
-        "1h",
-        "4h",
-        "1d"
+        "1h"
       ],
       "label_period_candles": 100,
       "include_shifted_candles": 6,
@@ -150,7 +148,7 @@
     },
     "model_training_parameters": {
       "device": "gpu",
-      "use_rmm:": true,
+      "use_rmm": true,
       "n_jobs": 8,
       "n_estimators": 1000,
       "verbosity": 1
