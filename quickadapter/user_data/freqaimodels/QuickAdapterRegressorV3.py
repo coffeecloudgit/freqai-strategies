@@ -1,6 +1,7 @@
 from enum import IntEnum
 import logging
 import json
+from statistics import median
 import time
 import numpy as np
 import pandas as pd
@@ -45,7 +46,7 @@ class QuickAdapterRegressorV3(BaseRegressionModel):
     https://github.com/sponsors/robcaulk
     """
 
-    version = "3.7.75"
+    version = "3.7.76"
 
     @cached_property
     def _optuna_config(self) -> dict:
@@ -441,6 +442,7 @@ class QuickAdapterRegressorV3(BaseRegressionModel):
             "harmonic_mean",
             "power_mean",
             "weighted_sum",
+            "kmeans",
             "knn_d1",
             "knn_d2_mean",
             "knn_d2_median",
@@ -470,18 +472,27 @@ class QuickAdapterRegressorV3(BaseRegressionModel):
         def calculate_distances(
             normalized_matrix: np.ndarray, metric: str
         ) -> np.ndarray:
+            n_objectives = normalized_matrix.shape[1]
+            n_samples = normalized_matrix.shape[0]
             label_p_order = float(self.ft_params.get("label_p_order", 2.0))
             np_weights = np.array(
-                self.ft_params.get("label_weights", [1.0] * normalized_matrix.shape[1])
+                self.ft_params.get("label_weights", [1.0] * n_objectives)
             )
-            if np_weights.size != normalized_matrix.shape[1]:
+            if np_weights.size != n_objectives:
                 raise ValueError("label_weights length must match number of objectives")
+            if np.any(np_weights < 0):
+                raise ValueError("label_weights values must be non-negative")
+            label_weights_sum = np.sum(np_weights)
+            if np.isclose(label_weights_sum, 0):
+                raise ValueError("label_weights sum cannot be zero")
+            np_weights = np_weights / label_weights_sum
             knn_kwargs = {}
             label_knn_metric = self.ft_params.get("label_knn_metric", "euclidean")
             if label_knn_metric == "minkowski" and isinstance(label_p_order, float):
                 knn_kwargs["p"] = label_p_order
 
-            ideal_point = np.ones(normalized_matrix.shape[1])
+            ideal_point = np.ones(n_objectives)
+            ideal_point_2d = ideal_point.reshape(1, -1)
 
             if metric in {
                 "braycurtis",
@@ -518,7 +529,7 @@ class QuickAdapterRegressorV3(BaseRegressionModel):
                     cdist_kwargs["p"] = label_p_order
                 return sp.spatial.distance.cdist(
                     normalized_matrix,
-                    ideal_point.reshape(1, -1),  # reshape ideal_point to 2D
+                    ideal_point_2d,
                     metric=metric,
                     **cdist_kwargs,
                 ).flatten()
@@ -544,21 +555,52 @@ class QuickAdapterRegressorV3(BaseRegressionModel):
                 ) - sp.stats.pmean(normalized_matrix, p=p, weights=np_weights, axis=1)
             elif metric == "weighted_sum":
                 return np.sum(np_weights * (ideal_point - normalized_matrix), axis=1)
+            elif metric == "kmeans":
+                label_kmeans_metric = self.ft_params.get(
+                    "label_kmeans_metric", "euclidean"
+                )
+                cdist_kwargs = {}
+                if label_kmeans_metric == "minkowski" and isinstance(
+                    label_p_order, float
+                ):
+                    cdist_kwargs["p"] = label_p_order
+                if n_samples == 0:
+                    return np.array([])
+                if n_samples == 1:
+                    return sp.spatial.distance.cdist(
+                        normalized_matrix,
+                        ideal_point_2d,
+                        metric=label_kmeans_metric,
+                        **cdist_kwargs,
+                    ).flatten()
+                n_clusters = min(max(2, int(np.sqrt(n_samples / 2))), 10, n_samples)
+                kmeans = sklearn.cluster.KMeans(
+                    n_clusters=n_clusters, random_state=42, n_init=10
+                )
+                cluster_labels = kmeans.fit_predict(normalized_matrix)
+                cluster_centers = kmeans.cluster_centers_
+                cluster_distances_to_ideal = sp.spatial.distance.cdist(
+                    cluster_centers,
+                    ideal_point_2d,
+                    metric=label_kmeans_metric,
+                    **cdist_kwargs,
+                ).flatten()
+                return cluster_distances_to_ideal[cluster_labels]
             elif metric == "knn_d1":
-                if normalized_matrix.shape[0] < 2:
-                    return np.full(normalized_matrix.shape[0], np.inf)
+                if n_samples < 2:
+                    return np.full(n_samples, np.inf)
                 nbrs = sklearn.neighbors.NearestNeighbors(
                     n_neighbors=2, metric=label_knn_metric, **knn_kwargs
                 ).fit(normalized_matrix)
                 distances, _ = nbrs.kneighbors(normalized_matrix)
                 return distances[:, 1]
             elif metric in {"knn_d2_mean", "knn_d2_median", "knn_d2_max"}:
-                if normalized_matrix.shape[0] < 2:
-                    return np.full(normalized_matrix.shape[0], np.inf)
+                if n_samples < 2:
+                    return np.full(n_samples, np.inf)
                 n_neighbors = (
                     min(
                         int(self.ft_params.get("label_knn_d2_n_neighbors", 4)),
-                        normalized_matrix.shape[0] - 1,
+                        n_samples - 1,
                     )
                     + 1
                 )
@@ -1074,8 +1116,8 @@ def zigzag(
     natr_period: int = 14,
     natr_ratio: float = 6.0,
 ) -> tuple[list[int], list[float], list[int]]:
-    min_confirmation_window: int = 2
-    max_confirmation_window: int = 6
+    min_confirmation_window: int = 3
+    max_confirmation_window: int = 5
     n = len(df)
     if df.empty or n < max(natr_period, 2 * max_confirmation_window + 1):
         return [], [], []
@@ -1128,7 +1170,7 @@ def zigzag(
     ) -> int:
         volatility_quantile = calculate_volatility_quantile(pos)
         if np.isnan(volatility_quantile):
-            return int(round(np.median([min_window, max_window])))
+            return int(round(median([min_window, max_window])))
 
         return np.clip(
             round(max_window - (max_window - min_window) * volatility_quantile),
@@ -1139,11 +1181,11 @@ def zigzag(
     def calculate_depth(
         pos: int,
         min_depth: int = 6,
-        max_depth: int = 24,
+        max_depth: int = 26,
     ) -> int:
         volatility_quantile = calculate_volatility_quantile(pos)
         if np.isnan(volatility_quantile):
-            return int(round(np.median([min_depth, max_depth])))
+            return int(round(median([min_depth, max_depth])))
 
         return np.clip(
             round(max_depth - (max_depth - min_depth) * volatility_quantile),
@@ -1155,12 +1197,15 @@ def zigzag(
         pos: int,
         min_strength: float = 0.5,
         max_strength: float = 1.5,
+        volatility_exponent: float = 1.5,
     ) -> float:
         volatility_quantile = calculate_volatility_quantile(pos)
         if np.isnan(volatility_quantile):
-            return np.median([min_strength, max_strength])
+            return median([min_strength, max_strength])
 
-        return min_strength + (max_strength - min_strength) * volatility_quantile
+        return min_strength + (max_strength - min_strength) * (
+            volatility_quantile**volatility_exponent
+        )
 
     def update_candidate_pivot(pos: int, value: float, direction: TrendDirection):
         nonlocal candidate_pivot_pos, candidate_pivot_value, candidate_pivot_direction
@@ -1378,7 +1423,7 @@ def label_objective(
         max_label_period_candles,
         step=candles_step,
     )
-    label_natr_ratio = trial.suggest_float("label_natr_ratio", 4.0, 16.0, step=0.01)
+    label_natr_ratio = trial.suggest_float("label_natr_ratio", 2.0, 10.0, step=0.01)
 
     df = df.iloc[
         -(
