@@ -60,11 +60,11 @@ class QuickAdapterV3(IStrategy):
     INTERFACE_VERSION = 3
 
     def version(self) -> str:
-        return "3.3.80"
+        return "3.3.79"
 
     timeframe = "5m"
 
-    stoploss = -0.02
+    stoploss = -0.03
     use_custom_stoploss = True
 
     # Trailing stop:
@@ -90,6 +90,18 @@ class QuickAdapterV3(IStrategy):
 
     process_only_new_candles = True
 
+    def __init__(self, config: dict):
+        super().__init__(config)
+        self._freqai_info = config.get('freqai', {})
+
+    @property
+    def freqai_info(self):
+        return self._freqai_info
+
+    @freqai_info.setter
+    def freqai_info(self, value):
+        self._freqai_info = value
+    
     @cached_property
     def can_short(self) -> bool:
         return self.is_short_allowed()
