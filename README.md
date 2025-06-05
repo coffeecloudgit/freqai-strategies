@@ -12,7 +12,7 @@ freqtrade download-data --config user_data/config-cpu.json --timerange 20240101-
 ```
 
 ```shell
-freqtrade backtesting --config user_data/config-cpu.json --strategy QuickAdapterV3 --freqaimodel QuickAdapterRegressorV3 --timerange 20250403-20250603
+freqtrade backtesting --config user_data/config-cpu.json --strategy QuickAdapterV3 --freqaimodel QuickAdapterRegressorV3 --timerange 20250403-20250603 --logfile user_data/logs/freqtrade.log
 ```
 # 开启交易 gpu
 ```shell

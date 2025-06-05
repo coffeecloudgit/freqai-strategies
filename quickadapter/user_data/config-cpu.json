@@ -50,7 +50,8 @@
     },
     "pair_whitelist": [
       "BTC/USDT:USDT",
-      "SOL/USDT:USDT"
+      "SOL/USDT:USDT",
+      "DOGE/USDT:USDT"
     ]
   },
   "pairlists": [
@@ -73,7 +74,7 @@
     "ws_token": "",
     "CORS_origins": [],
     "username": "freqtrader",
-    "password": "freqtrader"
+    "password": "123456"
   },
   "freqai": {
     "enabled": true,
@@ -84,8 +85,8 @@
     "train_period_days": 60,
     "backtest_period_days": 2,
     "write_metrics_to_disk": false,
-    "identifier": "quickadapter-xgboost04",
-    "fit_live_predictions_candles": 100,
+    "identifier": "quickadapter-xgboost01",
+    "fit_live_predictions_candles": 200,
     "data_kitchen_thread_count": 8,
     "track_performance": false,
     "outlier_threshold": 0.999,
@@ -111,14 +112,13 @@
     },
     "feature_parameters": {
       "include_corr_pairlist": [
-        "BTC/USDT:USDT",
-        "ETH/USDT:USDT"
+        "BTC/USDT:USDT"
       ],
       "include_timeframes": [
         "5m",
         "15m"
       ],
-      "label_period_candles": 100,
+      "label_period_candles": 50,
       "include_shifted_candles": 6,
       "DI_threshold": 10,
       "weight_factor": 0.9,
