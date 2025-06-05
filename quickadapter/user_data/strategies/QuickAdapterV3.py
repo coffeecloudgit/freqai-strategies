@@ -742,3 +742,26 @@ class QuickAdapterV3(IStrategy):
             with best_params_path.open("r", encoding="utf-8") as read_file:
                 return json.load(read_file)
         return None
+    
+    def optuna_optimize(self, trial: optuna.Trial) -> float:
+        # 修改 pruner 配置
+        pruner = optuna.pruners.MedianPruner(
+            n_startup_trials=5,
+            n_warmup_steps=10,
+            interval_steps=1
+        )
+        
+        study = optuna.create_study(
+            direction="maximize",
+            pruner=pruner,  # 使用 MedianPruner 替代默认的 HyperbandPruner
+            study_name=f"optuna_{self.pair}"
+        )
+        
+        study.optimize(
+            self._optuna_objective,
+            n_trials=self.freqai_info.get("optuna_trials", 100),
+            timeout=self.freqai_info.get("optuna_timeout", 3600),
+            n_jobs=self.freqai_info.get("optuna_n_jobs", 1)
+        )
+        
+        return study.best_value
