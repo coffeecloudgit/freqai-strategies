@@ -3,6 +3,7 @@
 # 安装依赖
 ```shell
 pip install optuna stable-baselines3 sb3-contrib
+pip install optuna-integration
 ```
 
 # 下载回测数据
