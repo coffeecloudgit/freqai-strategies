@@ -16,7 +16,7 @@ freqtrade backtesting --config user_data/config-cpu.json --strategy QuickAdapter
 ```
 # 开启交易 gpu
 ```shell
-freqtrade trade --config user_data/config-gpu.json --strategy QuickAdapterV3 --freqaimodel QuickAdapterRegressorV3
+freqtrade trade --config user_data/config-gpu.json --strategy QuickAdapterV3 --freqaimodel QuickAdapterRegressorV3 --logfile user_data/logs/freqtrade.log
 ```
 
 
