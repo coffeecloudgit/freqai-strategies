@@ -46,7 +46,7 @@ class QuickAdapterRegressorV3(BaseRegressionModel):
     https://github.com/sponsors/robcaulk
     """
 
-    version = "3.7.76"
+    version = "3.7.78"
 
     @cached_property
     def _optuna_config(self) -> dict:
@@ -1195,8 +1195,8 @@ def zigzag(
 
     def calculate_min_slope_strength(
         pos: int,
-        min_strength: float = 0.5,
-        max_strength: float = 1.5,
+        min_strength: float = 0.4,
+        max_strength: float = 1.8,
         volatility_exponent: float = 1.5,
     ) -> float:
         volatility_quantile = calculate_volatility_quantile(pos)
@@ -1340,29 +1340,19 @@ def zigzag(
         )
         if is_initial_high_move_significant and is_initial_low_move_significant:
             if initial_move_from_high > initial_move_from_low:
-                if is_reversal_confirmed(
-                    initial_high_pos, initial_high_pos, TrendDirection.DOWN
-                ):
-                    add_pivot(initial_high_pos, initial_high, TrendDirection.UP)
-                    state = TrendDirection.DOWN
-                    break
-            else:
-                if is_reversal_confirmed(
-                    initial_low_pos, initial_low_pos, TrendDirection.UP
-                ):
-                    add_pivot(initial_low_pos, initial_low, TrendDirection.DOWN)
-                    state = TrendDirection.UP
-                    break
-        else:
-            if is_initial_high_move_significant and is_reversal_confirmed(
-                initial_high_pos, initial_high_pos, TrendDirection.DOWN
-            ):
                 add_pivot(initial_high_pos, initial_high, TrendDirection.UP)
                 state = TrendDirection.DOWN
                 break
-            elif is_initial_low_move_significant and is_reversal_confirmed(
-                initial_low_pos, initial_low_pos, TrendDirection.UP
-            ):
+            else:
+                add_pivot(initial_low_pos, initial_low, TrendDirection.DOWN)
+                state = TrendDirection.UP
+                break
+        else:
+            if is_initial_high_move_significant:
+                add_pivot(initial_high_pos, initial_high, TrendDirection.UP)
+                state = TrendDirection.DOWN
+                break
+            elif is_initial_low_move_significant:
                 add_pivot(initial_low_pos, initial_low, TrendDirection.DOWN)
                 state = TrendDirection.UP
                 break

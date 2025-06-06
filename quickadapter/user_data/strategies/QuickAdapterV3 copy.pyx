@@ -40,7 +40,7 @@ MINIMA_THRESHOLD_COLUMN = "&s-minima_threshold"
 MAXIMA_THRESHOLD_COLUMN = "&s-maxima_threshold"
 
 
-class QuickAdapterV3(IStrategy):
+class QuickAdapterV301(IStrategy):
     """
     The following freqtrade strategy is released to sponsors of the non-profit FreqAI open-source project.
     If you find the FreqAI project useful, please consider supporting it by becoming a sponsor.

@@ -6,7 +6,7 @@ import math
 from pathlib import Path
 import talib.abstract as ta
 from pandas import DataFrame, Series, isna
-from typing import Optional
+from typing import Callable, Optional
 from freqtrade.exchange import timeframe_to_minutes, timeframe_to_prev_date
 from freqtrade.strategy.interface import IStrategy
 from freqtrade.strategy import stoploss_from_absolute
@@ -18,6 +18,7 @@ import pandas_ta as pta
 from Utils import (
     alligator,
     bottom_change_percent,
+    calculate_quantile,
     get_zl_ma_fn,
     zigzag,
     ewo,
@@ -60,7 +61,7 @@ class QuickAdapterV3(IStrategy):
     INTERFACE_VERSION = 3
 
     def version(self) -> str:
-        return "3.3.80"
+        return "3.3.82"
 
     timeframe = "5m"
 
@@ -179,6 +180,13 @@ class QuickAdapterV3(IStrategy):
                     ),
                 }
             )
+        self._throttle_modulo = max(
+            1,
+            round(
+                (timeframe_to_minutes(self.config.get("timeframe")) * 60)
+                / self.config.get("internals", {}).get("process_throttle_secs", 5)
+            ),
+        )
 
     def feature_engineering_expand_all(
         self, dataframe: DataFrame, period: int, metadata: dict, **kwargs
@@ -483,7 +491,30 @@ class QuickAdapterV3(IStrategy):
             isna(trade_duration) or trade_duration <= 0
         )
 
-    def get_trade_natr(
+    def get_trade_quantile_natr(self, df: DataFrame, trade: Trade) -> Optional[float]:
+        label_natr = df.get("natr_label_period_candles")
+        if label_natr is None or label_natr.empty:
+            return None
+        entry_date = self.get_trade_entry_date(trade)
+        entry_mask = df.get("date") == entry_date
+        if not entry_mask.any():
+            return None
+        entry_natr = label_natr[entry_mask].iloc[0]
+        if isna(entry_natr) or entry_natr < 0:
+            return None
+        current_natr = label_natr.iloc[-1]
+        if isna(current_natr) or current_natr < 0:
+            return None
+        trade_volatility_quantile = calculate_quantile(
+            label_natr.to_numpy(), entry_natr
+        )
+        if isna(trade_volatility_quantile):
+            return None
+        return np.interp(
+            trade_volatility_quantile, [0.0, 1.0], [current_natr, entry_natr]
+        )
+
+    def get_trade_moving_average_natr(
         self, df: DataFrame, pair: str, trade_duration_candles: int
     ) -> Optional[float]:
         if not QuickAdapterV3.is_trade_duration_valid(trade_duration_candles):
@@ -491,7 +522,7 @@ class QuickAdapterV3(IStrategy):
         label_natr = df.get("natr_label_period_candles")
         if label_natr is None or label_natr.empty:
             return None
-        trade_natr = np.nan
+        trade_moving_average_natr = np.nan
         if trade_duration_candles >= 2:
             zl_kama = get_zl_ma_fn("kama")
             try:
@@ -502,14 +533,33 @@ class QuickAdapterV3(IStrategy):
                     ~np.isnan(trade_kama_natr_values)
                 ]
                 if trade_kama_natr_values.size > 0:
-                    trade_natr = trade_kama_natr_values[-1]
+                    trade_moving_average_natr = trade_kama_natr_values[-1]
             except Exception as e:
                 logger.error(
                     f"Failed to calculate KAMA for pair {pair}: {str(e)}", exc_info=True
                 )
-        if isna(trade_natr):
-            trade_natr = zlema(label_natr, period=trade_duration_candles).iloc[-1]
-        return trade_natr
+        if isna(trade_moving_average_natr):
+            trade_moving_average_natr = zlema(
+                label_natr, period=trade_duration_candles
+            ).iloc[-1]
+        return trade_moving_average_natr
+
+    def get_trade_natr(
+        self, df: DataFrame, trade: Trade, trade_duration_candles: int
+    ) -> Optional[float]:
+        trade_price_target = self.config.get("exit_pricing", {}).get(
+            "trade_price_target", "moving_average"
+        )
+        if trade_price_target == "quantile":
+            return self.get_trade_quantile_natr(df, trade)
+        elif trade_price_target == "moving_average":
+            return self.get_trade_moving_average_natr(
+                df, trade.pair, trade_duration_candles
+            )
+        else:
+            raise ValueError(
+                f"Invalid trade_price_target: {trade_price_target}. Expected 'quantile' or 'moving_average'."
+            )
 
     def get_stoploss_distance(
         self, df: DataFrame, trade: Trade, current_rate: float
@@ -517,7 +567,7 @@ class QuickAdapterV3(IStrategy):
         trade_duration_candles = self.get_trade_duration_candles(df, trade)
         if not QuickAdapterV3.is_trade_duration_valid(trade_duration_candles):
             return None
-        trade_natr = self.get_trade_natr(df, trade.pair, trade_duration_candles)
+        trade_natr = self.get_trade_natr(df, trade, trade_duration_candles)
         if isna(trade_natr) or trade_natr < 0:
             return None
         return (
@@ -531,7 +581,7 @@ class QuickAdapterV3(IStrategy):
         trade_duration_candles = self.get_trade_duration_candles(df, trade)
         if not QuickAdapterV3.is_trade_duration_valid(trade_duration_candles):
             return None
-        trade_natr = self.get_trade_natr(df, trade.pair, trade_duration_candles)
+        trade_natr = self.get_trade_natr(df, trade, trade_duration_candles)
         if isna(trade_natr) or trade_natr < 0:
             return None
         return (
@@ -540,6 +590,22 @@ class QuickAdapterV3(IStrategy):
             * self.get_take_profit_natr_ratio(trade.pair)
             * math.log10(9.75 + 0.25 * trade_duration_candles)
         )
+
+    def throttle_callback(
+        self,
+        pair: str,
+        callback: Callable[[], None],
+        current_time: Optional[datetime] = None,
+    ) -> None:
+        if current_time is None:
+            current_time = datetime.now(datetime.timezone.utc)
+        if hash(pair + str(current_time)) % self._throttle_modulo == 0:
+            try:
+                callback()
+            except Exception as e:
+                logger.error(
+                    f"Error executing callback for {pair}: {str(e)}", exc_info=True
+                )
 
     def custom_stoploss(
         self,
@@ -612,8 +678,12 @@ class QuickAdapterV3(IStrategy):
             trade.open_rate + (-1 if trade.is_short else 1) * take_profit_distance
         )
         trade.set_custom_data(key="take_profit_price", value=take_profit_price)
-        logger.info(
-            f"Trade {trade.trade_direction} for {pair}: open price {trade.open_rate}, current price {current_rate}, TP price {take_profit_price}"
+        self.throttle_callback(
+            pair=pair,
+            callback=lambda: logger.info(
+                f"Trade {trade.trade_direction} for {pair}: open price {trade.open_rate}, current price {current_rate}, TP price {take_profit_price}"
+            ),
+            current_time=current_time,
         )
         if trade.is_short:
             if current_rate <= take_profit_price:
