@@ -1,44 +1,48 @@
+import datetime
 import json
 import logging
-from functools import reduce, cached_property
-import datetime
 import math
+from functools import cached_property, lru_cache, reduce
 from pathlib import Path
-import talib.abstract as ta
-from pandas import DataFrame, Series, isna
-from typing import Callable, Optional
-from freqtrade.exchange import timeframe_to_minutes, timeframe_to_prev_date
-from freqtrade.strategy.interface import IStrategy
-from freqtrade.strategy import stoploss_from_absolute
-from technical.pivots_points import pivots_points
-from freqtrade.persistence import Trade
+from typing import Any, Callable, Literal, Optional, Sequence
+
 import numpy as np
 import pandas_ta as pta
+import talib.abstract as ta
+from freqtrade.exchange import timeframe_to_minutes, timeframe_to_prev_date
+from freqtrade.persistence import Trade
+from freqtrade.strategy import stoploss_from_absolute
+from freqtrade.strategy.interface import IStrategy
+from pandas import DataFrame, Series, isna
+from scipy.stats import t
+from technical.pivots_points import pivots_points
 
 from Utils import (
+    TrendDirection,
     alligator,
     bottom_change_percent,
+    calculate_n_extrema,
     calculate_quantile,
-    get_zl_ma_fn,
-    zigzag,
     ewo,
+    format_number,
+    get_distance,
+    get_zl_ma_fn,
     non_zero_diff,
     price_retracement_percent,
-    vwapb,
+    smooth_extrema,
     top_change_percent,
-    get_distance,
-    get_gaussian_window,
-    get_odd_window,
-    derive_gaussian_std_from_window,
-    zero_phase_gaussian,
+    vwapb,
+    zigzag,
     zlema,
 )
+
+debug = False
 
 logger = logging.getLogger(__name__)
 
 EXTREMA_COLUMN = "&s-extrema"
-MINIMA_THRESHOLD_COLUMN = "&s-minima_threshold"
 MAXIMA_THRESHOLD_COLUMN = "&s-maxima_threshold"
+MINIMA_THRESHOLD_COLUMN = "&s-minima_threshold"
 
 
 class QuickAdapterV3(IStrategy):
@@ -61,18 +65,17 @@ class QuickAdapterV3(IStrategy):
     INTERFACE_VERSION = 3
 
     def version(self) -> str:
-        return "3.3.82"
+        return "3.3.156"
+
+    def __init__(self, config: dict) -> None:
+        super().__init__(config)
+        # Initialize freqai_info early for startup_candle_count
+        self.freqai_info = config.get("freqai", {})
 
     timeframe = "5m"
 
     stoploss = -0.02
     use_custom_stoploss = True
-
-    # Trailing stop:
-    trailing_stop = False
-    trailing_stop_positive = 0.01
-    trailing_stop_positive_offset = 0.011
-    trailing_only_offset_is_reached = True
 
     order_types = {
         "entry": "limit",
@@ -82,8 +85,26 @@ class QuickAdapterV3(IStrategy):
         "force_entry": "limit",
         "stoploss": "limit",
         "stoploss_on_exchange": False,
-        "stoploss_on_exchange_interval": 120,
+        "stoploss_on_exchange_interval": 60,
         "stoploss_on_exchange_limit_ratio": 0.99,
+    }
+
+    default_exit_thresholds: dict[str, float] = {
+        "k_decl_v": 0.6,
+        "k_decl_a": 0.4,
+    }
+
+    default_exit_thresholds_calibration: dict[str, float] = {
+        "decline_quantile": 0.90,
+    }
+
+    position_adjustment_enable = True
+
+    # {stage: (natr_ratio_percent, stake_percent)}
+    partial_exit_stages: dict[int, tuple[float, float]] = {
+        0: (0.4858, 0.4),
+        1: (0.6180, 0.3),
+        2: (0.7640, 0.2),
     }
 
     timeframe_minutes = timeframe_to_minutes(timeframe)
@@ -96,7 +117,7 @@ class QuickAdapterV3(IStrategy):
         return self.is_short_allowed()
 
     @cached_property
-    def plot_config(self) -> dict:
+    def plot_config(self) -> dict[str, Any]:
         return {
             "main_plot": {},
             "subplots": {
@@ -105,9 +126,9 @@ class QuickAdapterV3(IStrategy):
                     "train_rmse": {"color": "#a3087a", "type": "line"},
                 },
                 "extrema": {
+                    MAXIMA_THRESHOLD_COLUMN: {"color": "#e6be0b", "type": "line"},
                     EXTREMA_COLUMN: {"color": "#f53580", "type": "line"},
                     MINIMA_THRESHOLD_COLUMN: {"color": "#4ae747", "type": "line"},
-                    MAXIMA_THRESHOLD_COLUMN: {"color": "#e6be0b", "type": "line"},
                 },
                 "min_max": {
                     "maxima": {"color": "#0dd6de", "type": "bar"},
@@ -117,24 +138,40 @@ class QuickAdapterV3(IStrategy):
         }
 
     @cached_property
-    def protections(self) -> list[dict]:
-        fit_live_predictions_candles = self.freqai_info.get(
-            "fit_live_predictions_candles", 100
+    def protections(self) -> list[dict[str, Any]]:
+        fit_live_predictions_candles = int(
+            self.freqai_info.get("fit_live_predictions_candles", 100)
+        )
+        estimated_trade_duration_candles = int(
+            self.config.get("estimated_trade_duration_candles", 48)
+        )
+        stoploss_guard_lookback_period_candles = int(fit_live_predictions_candles / 2)
+        stoploss_guard_trade_limit = max(
+            1,
+            int(
+                round(
+                    (
+                        stoploss_guard_lookback_period_candles
+                        / estimated_trade_duration_candles
+                    )
+                    * 0.75
+                )
+            ),
         )
         return [
-            {"method": "CooldownPeriod", "stop_duration_candles": 2},
+            {"method": "CooldownPeriod", "stop_duration_candles": 4},
             {
                 "method": "MaxDrawdown",
                 "lookback_period_candles": fit_live_predictions_candles,
-                "trade_limit": self.config.get("max_open_trades"),
+                "trade_limit": 2 * self.config.get("max_open_trades"),
                 "stop_duration_candles": fit_live_predictions_candles,
                 "max_allowed_drawdown": 0.2,
             },
             {
                 "method": "StoplossGuard",
-                "lookback_period_candles": fit_live_predictions_candles,
-                "trade_limit": 1,
-                "stop_duration_candles": fit_live_predictions_candles,
+                "lookback_period_candles": stoploss_guard_lookback_period_candles,
+                "trade_limit": stoploss_guard_trade_limit,
+                "stop_duration_candles": stoploss_guard_lookback_period_candles,
                 "only_per_pair": True,
             },
         ]
@@ -146,14 +183,26 @@ class QuickAdapterV3(IStrategy):
         # Match the predictions warmup period
         return self.freqai_info.get("fit_live_predictions_candles", 100)
 
+    @cached_property
+    def max_open_trades_per_side(self) -> int:
+        max_open_trades = self.config.get("max_open_trades")
+        if max_open_trades < 0:
+            return -1
+        if self.is_short_allowed():
+            if max_open_trades % 2 == 1:
+                max_open_trades += 1
+            return int(max_open_trades / 2)
+        else:
+            return max_open_trades
+
     def bot_start(self, **kwargs) -> None:
-        self.pairs = self.config.get("exchange", {}).get("pair_whitelist")
+        self.pairs: list[str] = self.config.get("exchange", {}).get("pair_whitelist")
         if not self.pairs:
             raise ValueError(
                 "FreqAI strategy requires StaticPairList method defined in pairlists configuration and 'pair_whitelist' defined in exchange section configuration"
             )
         if (
-            self.freqai_info.get("identifier") is None
+            not isinstance(self.freqai_info.get("identifier"), str)
             or self.freqai_info.get("identifier").strip() == ""
         ):
             raise ValueError(
@@ -164,33 +213,44 @@ class QuickAdapterV3(IStrategy):
             / "models"
             / self.freqai_info.get("identifier")
         )
-        self._label_params: dict[str, dict] = {}
+        self._label_params: dict[str, dict[str, Any]] = {}
         for pair in self.pairs:
             self._label_params[pair] = (
                 self.optuna_load_best_params(pair, "label")
                 if self.optuna_load_best_params(pair, "label")
                 else {
                     "label_period_candles": self.freqai_info["feature_parameters"].get(
-                        "label_period_candles", 50
+                        "label_period_candles", 24
                     ),
                     "label_natr_ratio": float(
                         self.freqai_info["feature_parameters"].get(
-                            "label_natr_ratio", 6.0
+                            "label_natr_ratio", 8.0
                         )
                     ),
                 }
             )
+        process_throttle_secs = self.config.get("internals", {}).get(
+            "process_throttle_secs", 5
+        )
         self._throttle_modulo = max(
             1,
-            round(
-                (timeframe_to_minutes(self.config.get("timeframe")) * 60)
-                / self.config.get("internals", {}).get("process_throttle_secs", 5)
+            int(
+                round(
+                    (timeframe_to_minutes(self.config.get("timeframe")) * 60)
+                    / process_throttle_secs
+                )
             ),
         )
+        self._max_history_size = int(12 * 60 * 60 / process_throttle_secs)
+        self._pnl_momentum_window_size = int(30 * 60 / process_throttle_secs)
+        self._exit_thresholds_calibration: dict[str, float] = {
+            **self.default_exit_thresholds_calibration,
+            **self.config.get("exit_pricing", {}).get("thresholds_calibration", {}),
+        }
 
     def feature_engineering_expand_all(
-        self, dataframe: DataFrame, period: int, metadata: dict, **kwargs
-    ):
+        self, dataframe: DataFrame, period: int, metadata: dict[str, Any], **kwargs
+    ) -> DataFrame:
         highs = dataframe.get("high")
         lows = dataframe.get("low")
         closes = dataframe.get("close")
@@ -229,8 +289,8 @@ class QuickAdapterV3(IStrategy):
         return dataframe
 
     def feature_engineering_expand_basic(
-        self, dataframe: DataFrame, metadata: dict, **kwargs
-    ):
+        self, dataframe: DataFrame, metadata: dict[str, Any], **kwargs
+    ) -> DataFrame:
         highs = dataframe.get("high")
         lows = dataframe.get("low")
         opens = dataframe.get("open")
@@ -345,7 +405,9 @@ class QuickAdapterV3(IStrategy):
         dataframe["%-raw_high"] = highs
         return dataframe
 
-    def feature_engineering_standard(self, dataframe: DataFrame, **kwargs):
+    def feature_engineering_standard(
+        self, dataframe: DataFrame, metadata: dict[str, Any], **kwargs
+    ) -> DataFrame:
         dates = dataframe.get("date")
 
         dataframe["%-day_of_week"] = (dates.dt.dayofweek + 1) / 7
@@ -358,10 +420,10 @@ class QuickAdapterV3(IStrategy):
         )
         if label_period_candles and isinstance(label_period_candles, int):
             return label_period_candles
-        return self.freqai_info["feature_parameters"].get("label_period_candles", 50)
+        return self.freqai_info["feature_parameters"].get("label_period_candles", 24)
 
-    def set_label_period_candles(self, pair: str, label_period_candles: int):
-        if isinstance(label_period_candles, int) and not np.isnan(label_period_candles):
+    def set_label_period_candles(self, pair: str, label_period_candles: int) -> None:
+        if isinstance(label_period_candles, int):
             self._label_params[pair]["label_period_candles"] = label_period_candles
 
     def get_label_natr_ratio(self, pair: str) -> float:
@@ -369,48 +431,84 @@ class QuickAdapterV3(IStrategy):
         if label_natr_ratio and isinstance(label_natr_ratio, float):
             return label_natr_ratio
         return float(
-            self.freqai_info["feature_parameters"].get("label_natr_ratio", 6.0)
+            self.freqai_info["feature_parameters"].get("label_natr_ratio", 8.0)
         )
 
-    def set_label_natr_ratio(self, pair: str, label_natr_ratio: float):
-        if isinstance(label_natr_ratio, float) and not np.isnan(label_natr_ratio):
+    def set_label_natr_ratio(self, pair: str, label_natr_ratio: float) -> None:
+        if isinstance(label_natr_ratio, float) and np.isfinite(label_natr_ratio):
             self._label_params[pair]["label_natr_ratio"] = label_natr_ratio
 
-    def get_entry_natr_ratio(self, pair: str) -> float:
-        return self.get_label_natr_ratio(pair) * 0.0125
+    def get_label_natr_ratio_percent(self, pair: str, percent: float) -> float:
+        if not isinstance(percent, float) or not (0.0 <= percent <= 1.0):
+            raise ValueError(
+                f"Invalid percent value: {percent}. It should be a float between 0 and 1"
+            )
+        return self.get_label_natr_ratio(pair) * percent
 
-    def get_stoploss_natr_ratio(self, pair: str) -> float:
-        return self.get_label_natr_ratio(pair) * 0.9
+    @staticmethod
+    @lru_cache(maxsize=128)
+    def td_format(
+        delta: datetime.timedelta, pattern: str = "{sign}{d}:{h:02d}:{m:02d}:{s:02d}"
+    ) -> str:
+        negative_duration = delta.total_seconds() < 0
+        delta = abs(delta)
+        duration: dict[str, Any] = {"d": delta.days}
+        duration["h"], remainder = divmod(delta.seconds, 3600)
+        duration["m"], duration["s"] = divmod(remainder, 60)
+        duration["ms"] = delta.microseconds // 1000
+        duration["sign"] = "-" if negative_duration else ""
+        try:
+            return pattern.format(**duration)
+        except (KeyError, ValueError) as e:
+            raise ValueError(f"Invalid pattern '{pattern}': {repr(e)}")
 
-    def get_take_profit_natr_ratio(self, pair: str) -> float:
-        return self.get_label_natr_ratio(pair) * 0.7
-
-    def set_freqai_targets(self, dataframe: DataFrame, metadata: dict, **kwargs):
+    def set_freqai_targets(
+        self, dataframe: DataFrame, metadata: dict[str, Any], **kwargs
+    ) -> DataFrame:
         pair = str(metadata.get("pair"))
         label_period_candles = self.get_label_period_candles(pair)
         label_natr_ratio = self.get_label_natr_ratio(pair)
-        pivots_indices, _, pivots_directions = zigzag(
+        pivots_indices, _, pivots_directions, _ = zigzag(
             dataframe,
             natr_period=label_period_candles,
             natr_ratio=label_natr_ratio,
         )
+        label_period = datetime.timedelta(
+            minutes=len(dataframe) * timeframe_to_minutes(self.config.get("timeframe"))
+        )
         dataframe[EXTREMA_COLUMN] = 0
         if len(pivots_indices) == 0:
             logger.warning(
-                f"No extrema to label for pair {pair} with label_period_candles {label_period_candles} and label_natr_ratio {label_natr_ratio:.2f}"
+                f"{pair}: no extrema to label (label_period={QuickAdapterV3.td_format(label_period)} / {label_period_candles=} / {label_natr_ratio=:.2f})"
             )
         else:
             for pivot_idx, pivot_dir in zip(pivots_indices, pivots_directions):
                 dataframe.at[pivot_idx, EXTREMA_COLUMN] = pivot_dir
-            dataframe["minima"] = np.where(dataframe[EXTREMA_COLUMN] == -1, -1, 0)
-            dataframe["maxima"] = np.where(dataframe[EXTREMA_COLUMN] == 1, 1, 0)
-        dataframe[EXTREMA_COLUMN] = self.smooth_extrema(
+            dataframe["minima"] = np.where(
+                dataframe[EXTREMA_COLUMN] == TrendDirection.DOWN, -1, 0
+            )
+            dataframe["maxima"] = np.where(
+                dataframe[EXTREMA_COLUMN] == TrendDirection.UP, 1, 0
+            )
+            logger.info(
+                f"{pair}: labeled {len(pivots_indices)} extrema (label_period={QuickAdapterV3.td_format(label_period)} / {label_period_candles=} / {label_natr_ratio=:.2f})"
+            )
+        dataframe[EXTREMA_COLUMN] = smooth_extrema(
             dataframe[EXTREMA_COLUMN],
-            self.freqai_info.get("extrema_smoothing_window", 5),
+            str(self.freqai_info.get("extrema_smoothing", "gaussian")),
+            int(self.freqai_info.get("extrema_smoothing_window", 5)),
+            float(self.freqai_info.get("extrema_smoothing_beta", 8.0)),
         )
+        if debug:
+            extrema = dataframe[EXTREMA_COLUMN]
+            logger.info(f"{extrema.to_numpy()=}")
+            n_extrema: int = calculate_n_extrema(extrema)
+            logger.info(f"{n_extrema=}")
         return dataframe
 
-    def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+    def populate_indicators(
+        self, dataframe: DataFrame, metadata: dict[str, Any]
+    ) -> DataFrame:
         dataframe = self.freqai.start(dataframe, metadata, self)
 
         dataframe["DI_catch"] = np.where(
@@ -435,35 +533,37 @@ class QuickAdapterV3(IStrategy):
 
         return dataframe
 
-    def populate_entry_trend(self, df: DataFrame, metadata: dict) -> DataFrame:
+    def populate_entry_trend(
+        self, dataframe: DataFrame, metadata: dict[str, Any]
+    ) -> DataFrame:
         enter_long_conditions = [
-            df.get("do_predict") == 1,
-            df.get("DI_catch") == 1,
-            df.get(EXTREMA_COLUMN) < df.get("minima_threshold"),
+            dataframe.get("do_predict") == 1,
+            dataframe.get("DI_catch") == 1,
+            dataframe.get(EXTREMA_COLUMN) < dataframe.get("minima_threshold"),
         ]
-
-        df.loc[
+        dataframe.loc[
             reduce(lambda x, y: x & y, enter_long_conditions),
             ["enter_long", "enter_tag"],
         ] = (1, "long")
 
         enter_short_conditions = [
-            df.get("do_predict") == 1,
-            df.get("DI_catch") == 1,
-            df.get(EXTREMA_COLUMN) > df.get("maxima_threshold"),
+            dataframe.get("do_predict") == 1,
+            dataframe.get("DI_catch") == 1,
+            dataframe.get(EXTREMA_COLUMN) > dataframe.get("maxima_threshold"),
         ]
-
-        df.loc[
+        dataframe.loc[
             reduce(lambda x, y: x & y, enter_short_conditions),
             ["enter_short", "enter_tag"],
         ] = (1, "short")
 
-        return df
+        return dataframe
 
-    def populate_exit_trend(self, df: DataFrame, metadata: dict) -> DataFrame:
-        return df
+    def populate_exit_trend(
+        self, dataframe: DataFrame, metadata: dict[str, Any]
+    ) -> DataFrame:
+        return dataframe
 
-    def get_trade_entry_date(self, trade: Trade) -> datetime:
+    def get_trade_entry_date(self, trade: Trade) -> datetime.datetime:
         return timeframe_to_prev_date(self.config.get("timeframe"), trade.open_date_utc)
 
     def get_trade_duration_candles(self, df: DataFrame, trade: Trade) -> Optional[int]:
@@ -486,32 +586,103 @@ class QuickAdapterV3(IStrategy):
         )
 
     @staticmethod
-    def is_trade_duration_valid(trade_duration: float) -> bool:
+    @lru_cache(maxsize=128)
+    def is_trade_duration_valid(trade_duration: Optional[int | float]) -> bool:
         return isinstance(trade_duration, (int, float)) and not (
             isna(trade_duration) or trade_duration <= 0
         )
 
-    def get_trade_quantile_natr(self, df: DataFrame, trade: Trade) -> Optional[float]:
+    def get_trade_weighted_interpolation_natr(
+        self, df: DataFrame, trade: Trade
+    ) -> Optional[float]:
         label_natr = df.get("natr_label_period_candles")
         if label_natr is None or label_natr.empty:
             return None
-        entry_date = self.get_trade_entry_date(trade)
-        entry_mask = df.get("date") == entry_date
-        if not entry_mask.any():
+        dates = df.get("date")
+        if dates is None or dates.empty:
             return None
-        entry_natr = label_natr[entry_mask].iloc[0]
+        entry_date = self.get_trade_entry_date(trade)
+        trade_label_natr = label_natr[dates >= entry_date]
+        if trade_label_natr.empty:
+            return None
+        entry_natr = trade_label_natr.iloc[0]
         if isna(entry_natr) or entry_natr < 0:
             return None
-        current_natr = label_natr.iloc[-1]
+        if len(trade_label_natr) == 1:
+            return entry_natr
+        current_natr = trade_label_natr.iloc[-1]
+        if isna(current_natr) or current_natr < 0:
+            return None
+        median_natr = trade_label_natr.median()
+
+        np_trade_label_natr = trade_label_natr.to_numpy()
+        entry_quantile = calculate_quantile(np_trade_label_natr, entry_natr)
+        current_quantile = calculate_quantile(np_trade_label_natr, current_natr)
+        median_quantile = calculate_quantile(np_trade_label_natr, median_natr)
+
+        if isna(entry_quantile) or isna(current_quantile) or isna(median_quantile):
+            return None
+
+        def calculate_weight(
+            quantile: float,
+            min_weight: float = 0.0,
+            max_weight: float = 1.0,
+            weighting_exponent: float = 1.5,
+        ) -> float:
+            normalized_distance_from_center = abs(quantile - 0.5) * 2.0
+            return (
+                min_weight
+                + (max_weight - min_weight)
+                * normalized_distance_from_center**weighting_exponent
+            )
+
+        entry_weight = calculate_weight(entry_quantile)
+        current_weight = calculate_weight(current_quantile)
+        median_weight = calculate_weight(median_quantile)
+
+        total_weight = entry_weight + current_weight + median_weight
+        if np.isclose(total_weight, 0.0):
+            return None
+        entry_weight /= total_weight
+        current_weight /= total_weight
+        median_weight /= total_weight
+
+        return (
+            entry_natr * entry_weight
+            + current_natr * current_weight
+            + median_natr * median_weight
+        )
+
+    def get_trade_interpolation_natr(
+        self, df: DataFrame, trade: Trade
+    ) -> Optional[float]:
+        label_natr = df.get("natr_label_period_candles")
+        if label_natr is None or label_natr.empty:
+            return None
+        dates = df.get("date")
+        if dates is None or dates.empty:
+            return None
+        entry_date = self.get_trade_entry_date(trade)
+        trade_label_natr = label_natr[dates >= entry_date]
+        if trade_label_natr.empty:
+            return None
+        entry_natr = trade_label_natr.iloc[0]
+        if isna(entry_natr) or entry_natr < 0:
+            return None
+        if len(trade_label_natr) == 1:
+            return entry_natr
+        current_natr = trade_label_natr.iloc[-1]
         if isna(current_natr) or current_natr < 0:
             return None
         trade_volatility_quantile = calculate_quantile(
-            label_natr.to_numpy(), entry_natr
+            trade_label_natr.to_numpy(), entry_natr
         )
         if isna(trade_volatility_quantile):
             return None
         return np.interp(
-            trade_volatility_quantile, [0.0, 1.0], [current_natr, entry_natr]
+            trade_volatility_quantile,
+            [0.0, 1.0],
+            [current_natr, entry_natr],
         )
 
     def get_trade_moving_average_natr(
@@ -522,7 +693,6 @@ class QuickAdapterV3(IStrategy):
         label_natr = df.get("natr_label_period_candles")
         if label_natr is None or label_natr.empty:
             return None
-        trade_moving_average_natr = np.nan
         if trade_duration_candles >= 2:
             zl_kama = get_zl_ma_fn("kama")
             try:
@@ -533,16 +703,13 @@ class QuickAdapterV3(IStrategy):
                     ~np.isnan(trade_kama_natr_values)
                 ]
                 if trade_kama_natr_values.size > 0:
-                    trade_moving_average_natr = trade_kama_natr_values[-1]
+                    return trade_kama_natr_values[-1]
             except Exception as e:
-                logger.error(
-                    f"Failed to calculate KAMA for pair {pair}: {str(e)}", exc_info=True
+                logger.warning(
+                    f"Failed to calculate trade NATR KAMA for pair {pair}: {repr(e)}. Falling back to last trade NATR value",
+                    exc_info=True,
                 )
-        if isna(trade_moving_average_natr):
-            trade_moving_average_natr = zlema(
-                label_natr, period=trade_duration_candles
-            ).iloc[-1]
-        return trade_moving_average_natr
+        return label_natr.iloc[-1]
 
     def get_trade_natr(
         self, df: DataFrame, trade: Trade, trade_duration_candles: int
@@ -550,19 +717,42 @@ class QuickAdapterV3(IStrategy):
         trade_price_target = self.config.get("exit_pricing", {}).get(
             "trade_price_target", "moving_average"
         )
-        if trade_price_target == "quantile":
-            return self.get_trade_quantile_natr(df, trade)
+        if trade_price_target == "interpolation":
+            return self.get_trade_interpolation_natr(df, trade)
+        elif trade_price_target == "weighted_interpolation":
+            return self.get_trade_weighted_interpolation_natr(df, trade)
         elif trade_price_target == "moving_average":
             return self.get_trade_moving_average_natr(
                 df, trade.pair, trade_duration_candles
             )
         else:
             raise ValueError(
-                f"Invalid trade_price_target: {trade_price_target}. Expected 'quantile' or 'moving_average'."
+                f"Invalid trade_price_target: {trade_price_target}. Expected 'interpolation', 'weighted_interpolation' or 'moving_average'."
             )
 
+    @staticmethod
+    def get_trade_exit_stage(trade: Trade) -> int:
+        exit_side = "buy" if trade.is_short else "sell"
+        try:
+            return sum(
+                1
+                for order in trade.orders
+                if order.side == exit_side and order.status in {"open", "closed"}
+            )
+        except Exception:
+            return 0
+
+    @staticmethod
+    @lru_cache(maxsize=128)
+    def get_stoploss_factor(trade_duration_candles: int) -> float:
+        return 2.75 / (1.2675 + math.atan(0.25 * trade_duration_candles))
+
     def get_stoploss_distance(
-        self, df: DataFrame, trade: Trade, current_rate: float
+        self,
+        df: DataFrame,
+        trade: Trade,
+        current_rate: float,
+        natr_ratio_percent: float,
     ) -> Optional[float]:
         trade_duration_candles = self.get_trade_duration_candles(df, trade)
         if not QuickAdapterV3.is_trade_duration_valid(trade_duration_candles):
@@ -573,11 +763,20 @@ class QuickAdapterV3(IStrategy):
         return (
             current_rate
             * (trade_natr / 100.0)
-            * self.get_stoploss_natr_ratio(trade.pair)
-            * (1 / math.log10(3.75 + 0.25 * trade_duration_candles))
+            * self.get_label_natr_ratio_percent(trade.pair, natr_ratio_percent)
+            * QuickAdapterV3.get_stoploss_factor(
+                trade_duration_candles + int(round(trade.nr_of_successful_exits**1.5))
+            )
         )
 
-    def get_take_profit_distance(self, df: DataFrame, trade: Trade) -> Optional[float]:
+    @staticmethod
+    @lru_cache(maxsize=128)
+    def get_take_profit_factor(trade_duration_candles: int) -> float:
+        return math.log10(9.75 + 0.25 * trade_duration_candles)
+
+    def get_take_profit_distance(
+        self, df: DataFrame, trade: Trade, natr_ratio_percent: float
+    ) -> Optional[float]:
         trade_duration_candles = self.get_trade_duration_candles(df, trade)
         if not QuickAdapterV3.is_trade_duration_valid(trade_duration_candles):
             return None
@@ -587,66 +786,635 @@ class QuickAdapterV3(IStrategy):
         return (
             trade.open_rate
             * (trade_natr / 100.0)
-            * self.get_take_profit_natr_ratio(trade.pair)
-            * math.log10(9.75 + 0.25 * trade_duration_candles)
+            * self.get_label_natr_ratio_percent(trade.pair, natr_ratio_percent)
+            * QuickAdapterV3.get_take_profit_factor(trade_duration_candles)
         )
 
     def throttle_callback(
         self,
         pair: str,
+        current_time: datetime.datetime,
         callback: Callable[[], None],
-        current_time: Optional[datetime] = None,
     ) -> None:
-        if current_time is None:
-            current_time = datetime.now(datetime.timezone.utc)
         if hash(pair + str(current_time)) % self._throttle_modulo == 0:
             try:
                 callback()
             except Exception as e:
                 logger.error(
-                    f"Error executing callback for {pair}: {str(e)}", exc_info=True
+                    f"Error executing callback for {pair}: {repr(e)}", exc_info=True
                 )
 
     def custom_stoploss(
         self,
         pair: str,
         trade: Trade,
-        current_time: datetime,
+        current_time: datetime.datetime,
         current_rate: float,
         current_profit: float,
+        after_fill: bool,
         **kwargs,
     ) -> Optional[float]:
         df, _ = self.dp.get_analyzed_dataframe(
             pair=pair, timeframe=self.config.get("timeframe")
         )
-
         if df.empty:
             return None
 
-        stoploss_distance = self.get_stoploss_distance(df, trade, current_rate)
+        stoploss_distance = self.get_stoploss_distance(df, trade, current_rate, 0.7860)
         if isna(stoploss_distance) or stoploss_distance <= 0:
             return None
-        sign = 1 if trade.is_short else -1
         return stoploss_from_absolute(
-            current_rate + (sign * stoploss_distance),
+            current_rate + (1 if trade.is_short else -1) * stoploss_distance,
             current_rate=current_rate,
             is_short=trade.is_short,
             leverage=trade.leverage,
         )
 
+    @staticmethod
+    def can_take_profit(
+        trade: Trade, current_rate: float, take_profit_price: float
+    ) -> bool:
+        return (trade.is_short and current_rate <= take_profit_price) or (
+            not trade.is_short and current_rate >= take_profit_price
+        )
+
+    def get_take_profit_price(
+        self, df: DataFrame, trade: Trade, exit_stage: int
+    ) -> Optional[float]:
+        natr_ratio_percent = (
+            self.partial_exit_stages[exit_stage][0]
+            if exit_stage in self.partial_exit_stages
+            else 1.0
+        )
+        take_profit_distance = self.get_take_profit_distance(
+            df, trade, natr_ratio_percent
+        )
+        if isna(take_profit_distance) or take_profit_distance <= 0:
+            return None
+
+        take_profit_price = (
+            trade.open_rate + (-1 if trade.is_short else 1) * take_profit_distance
+        )
+        self.safe_append_trade_take_profit_price(trade, take_profit_price, exit_stage)
+
+        return take_profit_price
+
+    @staticmethod
+    def _get_trade_history(trade: Trade) -> dict[str, list[float | tuple[int, float]]]:
+        return trade.get_custom_data(
+            "history", {"unrealized_pnl": [], "take_profit_price": []}
+        )
+
+    @staticmethod
+    def get_trade_unrealized_pnl_history(trade: Trade) -> list[float]:
+        history = QuickAdapterV3._get_trade_history(trade)
+        return history.get("unrealized_pnl", [])
+
+    @staticmethod
+    def get_trade_take_profit_price_history(
+        trade: Trade,
+    ) -> list[float | tuple[int, float]]:
+        history = QuickAdapterV3._get_trade_history(trade)
+        return history.get("take_profit_price", [])
+
+    def append_trade_unrealized_pnl(self, trade: Trade, pnl: float) -> list[float]:
+        history = QuickAdapterV3._get_trade_history(trade)
+        pnl_history = history.setdefault("unrealized_pnl", [])
+        pnl_history.append(pnl)
+        if len(pnl_history) > self._max_history_size:
+            pnl_history = pnl_history[-self._max_history_size :]
+            history["unrealized_pnl"] = pnl_history
+        trade.set_custom_data("history", history)
+        return pnl_history
+
+    def safe_append_trade_unrealized_pnl(self, trade: Trade, pnl: float) -> list[float]:
+        trade_unrealized_pnl_history = QuickAdapterV3.get_trade_unrealized_pnl_history(
+            trade
+        )
+        previous_unrealized_pnl = (
+            trade_unrealized_pnl_history[-1] if trade_unrealized_pnl_history else None
+        )
+        if previous_unrealized_pnl is None or not np.isclose(
+            previous_unrealized_pnl, pnl
+        ):
+            trade_unrealized_pnl_history = self.append_trade_unrealized_pnl(trade, pnl)
+        return trade_unrealized_pnl_history
+
+    def append_trade_take_profit_price(
+        self, trade: Trade, take_profit_price: float, exit_stage: int
+    ) -> list[float | tuple[int, float]]:
+        history = QuickAdapterV3._get_trade_history(trade)
+        price_history = history.setdefault("take_profit_price", [])
+        price_history.append((exit_stage, take_profit_price))
+        if len(price_history) > self._max_history_size:
+            price_history = price_history[-self._max_history_size :]
+            history["take_profit_price"] = price_history
+        trade.set_custom_data("history", history)
+        return price_history
+
+    def safe_append_trade_take_profit_price(
+        self, trade: Trade, take_profit_price: float, exit_stage: int
+    ) -> list[float | tuple[int, float]]:
+        trade_take_profit_price_history = (
+            QuickAdapterV3.get_trade_take_profit_price_history(trade)
+        )
+        previous_take_profit_entry = (
+            trade_take_profit_price_history[-1]
+            if trade_take_profit_price_history
+            else None
+        )
+        previous_exit_stage = None
+        previous_take_profit_price = None
+        if isinstance(previous_take_profit_entry, tuple):
+            previous_exit_stage = (
+                previous_take_profit_entry[0] if previous_take_profit_entry else None
+            )
+            previous_take_profit_price = (
+                previous_take_profit_entry[1] if previous_take_profit_entry else None
+            )
+        elif isinstance(previous_take_profit_entry, float):
+            previous_exit_stage = -1
+            previous_take_profit_price = previous_take_profit_entry
+        if (
+            previous_take_profit_price is None
+            or (previous_exit_stage is not None and previous_exit_stage != exit_stage)
+            or not np.isclose(previous_take_profit_price, take_profit_price)
+        ):
+            trade_take_profit_price_history = self.append_trade_take_profit_price(
+                trade, take_profit_price, exit_stage
+            )
+        return trade_take_profit_price_history
+
+    def adjust_trade_position(
+        self,
+        trade: Trade,
+        current_time: datetime.datetime,
+        current_rate: float,
+        current_profit: float,
+        min_stake: Optional[float],
+        max_stake: float,
+        current_entry_rate: float,
+        current_exit_rate: float,
+        current_entry_profit: float,
+        current_exit_profit: float,
+        **kwargs,
+    ) -> Optional[float] | tuple[Optional[float], Optional[str]]:
+        if trade.has_open_orders:
+            return None
+
+        trade_exit_stage = QuickAdapterV3.get_trade_exit_stage(trade)
+        if trade_exit_stage not in self.partial_exit_stages:
+            return None
+
+        df, _ = self.dp.get_analyzed_dataframe(
+            pair=trade.pair, timeframe=self.config.get("timeframe")
+        )
+        if df.empty:
+            return None
+
+        trade_take_profit_price = self.get_take_profit_price(
+            df, trade, trade_exit_stage
+        )
+        if isna(trade_take_profit_price):
+            return None
+
+        trade_partial_exit = QuickAdapterV3.can_take_profit(
+            trade, current_rate, trade_take_profit_price
+        )
+        if not trade_partial_exit:
+            self.throttle_callback(
+                pair=trade.pair,
+                current_time=current_time,
+                callback=lambda: logger.info(
+                    f"Trade {trade.trade_direction} {trade.pair} stage {trade_exit_stage} | "
+                    f"Take Profit: {format_number(trade_take_profit_price)}, Rate: {format_number(current_rate)}"
+                ),
+            )
+        if trade_partial_exit:
+            trade_stake_percent = self.partial_exit_stages[trade_exit_stage][1]
+            trade_partial_stake_amount = trade.stake_amount * trade_stake_percent
+            return (
+                -trade_partial_stake_amount,
+                f"take_profit_{trade.trade_direction}_{trade_exit_stage}",
+            )
+
+        return None
+
+    @staticmethod
+    def weighted_close(series: Series) -> float:
+        return (series.get("high") + series.get("low") + 2 * series.get("close")) / 4.0
+
+    @staticmethod
+    def _normalize_candle_idx(length: int, idx: int) -> int:
+        """
+        Normalize a candle index against a sequence length:
+        - supports negative indexing (Python-like),
+        - clamps to [0, length-1].
+        """
+        if length <= 0:
+            return 0
+        if idx < 0:
+            idx = length + idx
+        return max(0, min(idx, length - 1))
+
+    def _calculate_candle_deviation(
+        self,
+        df: DataFrame,
+        pair: str,
+        min_natr_ratio_percent: float,
+        max_natr_ratio_percent: float,
+        candle_idx: int = -1,
+        interpolation_direction: Literal["direct", "inverse"] = "direct",
+        quantile_exponent: float = 1.5,
+    ) -> Optional[float]:
+        label_natr_series = df.get("natr_label_period_candles")
+        if label_natr_series is None or label_natr_series.empty:
+            return None
+
+        candle_idx = QuickAdapterV3._normalize_candle_idx(
+            len(label_natr_series), candle_idx
+        )
+
+        label_natr_values = label_natr_series.iloc[: candle_idx + 1].to_numpy()
+        if label_natr_values.size == 0:
+            return None
+        candle_label_natr_value = label_natr_values[-1]
+        if isna(candle_label_natr_value) or candle_label_natr_value < 0:
+            return None
+        label_period_candles = self.get_label_period_candles(pair)
+        candle_label_natr_value_quantile = calculate_quantile(
+            label_natr_values[-label_period_candles:], candle_label_natr_value
+        )
+        if isna(candle_label_natr_value_quantile):
+            return None
+
+        if interpolation_direction == "direct":
+            natr_ratio_percent = (
+                min_natr_ratio_percent
+                + (max_natr_ratio_percent - min_natr_ratio_percent)
+                * candle_label_natr_value_quantile**quantile_exponent
+            )
+        elif interpolation_direction == "inverse":
+            natr_ratio_percent = (
+                max_natr_ratio_percent
+                - (max_natr_ratio_percent - min_natr_ratio_percent)
+                * candle_label_natr_value_quantile**quantile_exponent
+            )
+        else:
+            raise ValueError(
+                f"Invalid interpolation_direction: {interpolation_direction}. Expected 'direct' or 'inverse'"
+            )
+        return (candle_label_natr_value / 100.0) * self.get_label_natr_ratio_percent(
+            pair, natr_ratio_percent
+        )
+
+    def calculate_candle_threshold(
+        self,
+        df: DataFrame,
+        pair: str,
+        side: str,
+        min_natr_ratio_percent: float,
+        max_natr_ratio_percent: float,
+        candle_idx: int = -1,
+    ) -> float:
+        current_deviation = self._calculate_candle_deviation(
+            df,
+            pair,
+            min_natr_ratio_percent=min_natr_ratio_percent,
+            max_natr_ratio_percent=max_natr_ratio_percent,
+            candle_idx=candle_idx,
+            interpolation_direction="direct",
+        )
+        if isna(current_deviation) or current_deviation <= 0:
+            return np.nan
+
+        candle_idx = QuickAdapterV3._normalize_candle_idx(len(df), candle_idx)
+
+        candle = df.iloc[candle_idx]
+        candle_close = candle.get("close")
+        candle_open = candle.get("open")
+        if isna(candle_close) or isna(candle_open):
+            return np.nan
+        is_candle_bullish: bool = candle_close > candle_open
+        is_candle_bearish: bool = candle_close < candle_open
+
+        if side == "long":
+            base_price = (
+                QuickAdapterV3.weighted_close(candle)
+                if is_candle_bearish
+                else candle_close
+            )
+            return base_price * (1 + current_deviation)
+        elif side == "short":
+            base_price = (
+                QuickAdapterV3.weighted_close(candle)
+                if is_candle_bullish
+                else candle_close
+            )
+            return base_price * (1 - current_deviation)
+
+        raise ValueError(f"Invalid side: {side}. Expected 'long' or 'short'")
+
+    def reversal_confirmed(
+        self,
+        df: DataFrame,
+        pair: str,
+        side: str,
+        order: Literal["entry", "exit"],
+        rate: float,
+        min_natr_ratio_percent: float = 0.0095,
+        max_natr_ratio_percent: float = 0.095,
+        lookback_period: int = 1,
+        decay_ratio: float = 0.5,
+    ) -> bool:
+        """
+        Confirm a reversal using a multi-candle lookback chain.
+        Requirements:
+        - Always: current rate must break the current candle threshold (candle -1) for the given side.
+        - If lookback_period > 0: for k = 1..lookback_period, close[-k] must have broken the threshold
+          computed on candle [-(k+1)].
+        Decay:
+        - A geometric decay is applied for each lookback step k:
+          min_natr_ratio_percent/max_natr_ratio_percent bounds are multiplied
+          by (decay_ratio ** k) and clamped to [0, 1] for the threshold computed on candle [-(k+1)].
+          Default decay_ratio=0.5.
+          Set decay_ratio=1.0 to disable decay and keep the current behavior.
+        Fallbacks:
+        - If thresholds or closes are unavailable for any k, only the current threshold condition is enforced.
+        Logging:
+        - When returning False, this method logs the failing condition with contextual values.
+        """
+        if df.empty:
+            return False
+        if side not in {"long", "short"}:
+            return False
+        if order not in {"entry", "exit"}:
+            return False
+
+        lookback_period = max(0, min(int(lookback_period), len(df) - 1))
+        if not (0.0 < decay_ratio <= 1.0):
+            decay_ratio = 1.0
+
+        current_threshold = self.calculate_candle_threshold(
+            df,
+            pair,
+            side,
+            min_natr_ratio_percent=min_natr_ratio_percent,
+            max_natr_ratio_percent=max_natr_ratio_percent,
+            candle_idx=-1,
+        )
+        current_ok = np.isfinite(current_threshold) and (
+            (side == "long" and rate > current_threshold)
+            or (side == "short" and rate < current_threshold)
+        )
+        trade_direction = side
+        if order == "exit":
+            if side == "long":
+                trade_direction = "short"
+            if side == "short":
+                trade_direction = "long"
+        if not current_ok:
+            logger.info(
+                f"User denied {trade_direction} {order} for {pair}: rate {format_number(rate)} did not break threshold {format_number(current_threshold)}"
+            )
+            return False
+
+        if lookback_period <= 0:
+            return current_ok
+
+        for k in range(1, lookback_period + 1):
+            close_k = df.iloc[-k].get("close")
+            if not isinstance(close_k, (int, float)) or not np.isfinite(close_k):
+                return current_ok
+
+            decay_factor = decay_ratio**k
+            decayed_min_natr_ratio_percent = max(
+                0.0, min(1.0, min_natr_ratio_percent * decay_factor)
+            )
+            decayed_max_natr_ratio_percent = max(
+                decayed_min_natr_ratio_percent,
+                min(1.0, max_natr_ratio_percent * decay_factor),
+            )
+
+            threshold_k = self.calculate_candle_threshold(
+                df,
+                pair,
+                side,
+                min_natr_ratio_percent=decayed_min_natr_ratio_percent,
+                max_natr_ratio_percent=decayed_max_natr_ratio_percent,
+                candle_idx=-(k + 1),
+            )
+            if not isinstance(threshold_k, (int, float)) or not np.isfinite(
+                threshold_k
+            ):
+                return current_ok
+
+            if (side == "long" and not (close_k > threshold_k)) or (
+                side == "short" and not (close_k < threshold_k)
+            ):
+                logger.info(
+                    f"User denied {trade_direction} {order} for {pair}: "
+                    f"close_k[{-k}] {format_number(close_k)} "
+                    f"did not break threshold_k[{-(k + 1)}] {format_number(threshold_k)} "
+                    f"(decayed min/max natr_ratio_percent: min={format_number(decayed_min_natr_ratio_percent)}, max={format_number(decayed_max_natr_ratio_percent)})"
+                )
+                return False
+
+        return True
+
+    @staticmethod
+    def get_pnl_momentum(
+        unrealized_pnl_history: Sequence[float], window_size: int
+    ) -> tuple[float, float, float, float, float, float, float, float]:
+        unrealized_pnl_history = np.asarray(unrealized_pnl_history)
+
+        velocity = np.diff(unrealized_pnl_history)
+        velocity_std = np.std(velocity, ddof=1) if velocity.size > 1 else 0.0
+        acceleration = np.diff(velocity)
+        acceleration_std = (
+            np.std(acceleration, ddof=1) if acceleration.size > 1 else 0.0
+        )
+
+        mean_velocity = np.mean(velocity) if velocity.size > 0 else 0.0
+        mean_acceleration = np.mean(acceleration) if acceleration.size > 0 else 0.0
+
+        if window_size > 0 and len(unrealized_pnl_history) > window_size:
+            recent_unrealized_pnl_history = unrealized_pnl_history[-window_size:]
+        else:
+            recent_unrealized_pnl_history = unrealized_pnl_history
+
+        recent_velocity = np.diff(recent_unrealized_pnl_history)
+        recent_velocity_std = (
+            np.std(recent_velocity, ddof=1) if recent_velocity.size > 1 else 0.0
+        )
+        recent_acceleration = np.diff(recent_velocity)
+        recent_acceleration_std = (
+            np.std(recent_acceleration, ddof=1) if recent_acceleration.size > 1 else 0.0
+        )
+
+        recent_mean_velocity = (
+            np.mean(recent_velocity) if recent_velocity.size > 0 else 0.0
+        )
+        recent_mean_acceleration = (
+            np.mean(recent_acceleration) if recent_acceleration.size > 0 else 0.0
+        )
+
+        return (
+            mean_velocity,
+            velocity_std,
+            mean_acceleration,
+            acceleration_std,
+            recent_mean_velocity,
+            recent_velocity_std,
+            recent_mean_acceleration,
+            recent_acceleration_std,
+        )
+
+    @staticmethod
+    @lru_cache(maxsize=128)
+    def _zscore(mean: float, std: float) -> float:
+        if not np.isfinite(mean) or not np.isfinite(std):
+            return np.nan
+        if np.isclose(std, 0.0):
+            return np.nan
+        return mean / std
+
+    @staticmethod
+    @lru_cache(maxsize=128)
+    def is_isoformat(string: str) -> bool:
+        if not isinstance(string, str):
+            return False
+        try:
+            datetime.datetime.fromisoformat(string)
+        except (ValueError, TypeError):
+            return False
+        return True
+
+    def _get_exit_thresholds(
+        self,
+        hist_len: int,
+        std_v_global: float,
+        std_a_global: float,
+        std_v_recent: float,
+        std_a_recent: float,
+        min_alpha: float = 0.05,
+    ) -> dict[str, float]:
+        q_decl = float(self._exit_thresholds_calibration.get("decline_quantile"))
+
+        recent_hist_len = min(hist_len, self._pnl_momentum_window_size)
+
+        n_v_global = max(0, hist_len - 1)
+        n_a_global = max(0, hist_len - 2)
+        n_v_recent = max(0, recent_hist_len - 1)
+        n_a_recent = max(0, recent_hist_len - 2)
+
+        if hist_len <= 0:
+            alpha_len = 1.0
+        else:
+            alpha_len = recent_hist_len / hist_len if hist_len > 0 else 1.0
+            if alpha_len < min_alpha:
+                alpha_len = min_alpha
+
+        def volatility_adjusted_alpha(
+            alpha_base: float,
+            sigma_global: float,
+            sigma_recent: float,
+            gamma: float = 1.25,
+            min_alpha: float = 0.05,
+        ) -> float:
+            if not (np.isfinite(sigma_global) and np.isfinite(sigma_recent)):
+                return alpha_base
+            if sigma_global <= 0 and sigma_recent <= 0:
+                return alpha_base
+            sigma_total = sigma_global + sigma_recent
+            if sigma_total <= 0:
+                return alpha_base
+            ratio = sigma_global / sigma_total
+            alpha_vol = alpha_base * (ratio**gamma)
+            return max(min_alpha, alpha_vol)
+
+        alpha_v = volatility_adjusted_alpha(
+            alpha_len, std_v_global, std_v_recent, min_alpha=min_alpha
+        )
+        alpha_a = volatility_adjusted_alpha(
+            alpha_len, std_a_global, std_a_recent, min_alpha=min_alpha
+        )
+        n_eff_v = alpha_v * n_v_recent + (1.0 - alpha_v) * n_v_global
+        n_eff_a = alpha_a * n_a_recent + (1.0 - alpha_a) * n_a_global
+
+        def effective_k(
+            q: float,
+            n_eff: float,
+            default_k: float,
+        ) -> float:
+            if not (0.0 < q < 1.0) or np.isclose(q, 0.0) or np.isclose(q, 1.0):
+                return default_k
+            try:
+                if n_eff < 2:
+                    return default_k
+                df_eff = max(n_eff - 1.0, 1.0)
+                k = float(t.ppf(q, df_eff)) / math.sqrt(n_eff)
+                if not np.isfinite(k):
+                    return default_k
+                return k
+            except Exception:
+                return default_k
+
+        k_decl_v = effective_k(
+            q_decl, n_eff_v, self.default_exit_thresholds["k_decl_v"]
+        )
+        k_decl_a = effective_k(
+            q_decl, n_eff_a, self.default_exit_thresholds["k_decl_a"]
+        )
+
+        if debug:
+            logger.info(
+                (
+                    "hist_len=%s recent_len=%s | alpha_len=%s | q_decl=%s | "
+                    "n_v_(global,recent)=(%s,%s) n_a_(global,recent)=(%s,%s) | "
+                    "std_v_(global,recent)=(%s,%s) std_a_(global,recent)=(%s,%s) | "
+                    "alpha_(v,a)=(%s,%s) | n_eff_(v,a)=(%s,%s) | "
+                    "k_decl_(v,a)=(%s,%s)"
+                ),
+                hist_len,
+                recent_hist_len,
+                format_number(alpha_len),
+                format_number(q_decl),
+                n_v_global,
+                n_v_recent,
+                n_a_global,
+                n_a_recent,
+                format_number(std_v_global),
+                format_number(std_v_recent),
+                format_number(std_a_global),
+                format_number(std_a_recent),
+                format_number(alpha_v),
+                format_number(alpha_a),
+                format_number(n_eff_v),
+                format_number(n_eff_a),
+                format_number(k_decl_v),
+                format_number(k_decl_a),
+            )
+
+        return {
+            "k_decl_v": k_decl_v,
+            "k_decl_a": k_decl_a,
+        }
+
     def custom_exit(
         self,
         pair: str,
         trade: Trade,
-        current_time: datetime,
+        current_time: datetime.datetime,
         current_rate: float,
         current_profit: float,
         **kwargs,
     ) -> Optional[str]:
+        self.safe_append_trade_unrealized_pnl(trade, current_profit)
+
         df, _ = self.dp.get_analyzed_dataframe(
             pair=pair, timeframe=self.config.get("timeframe")
         )
-
         if df.empty:
             return None
 
@@ -654,43 +1422,125 @@ class QuickAdapterV3(IStrategy):
         if last_candle.get("do_predict") == 2:
             return "model_expired"
         if last_candle.get("DI_catch") == 0:
-            return "outlier_detected"
-
-        entry_tag = trade.enter_tag
+            last_candle_date = last_candle.get("date")
+            last_outlier_date_isoformat = trade.get_custom_data("last_outlier_date")
+            last_outlier_date = (
+                datetime.datetime.fromisoformat(last_outlier_date_isoformat)
+                if QuickAdapterV3.is_isoformat(last_outlier_date_isoformat)
+                else None
+            )
+            if last_outlier_date != last_candle_date:
+                n_outliers = trade.get_custom_data("n_outliers", 0)
+                n_outliers += 1
+                logger.warning(
+                    f"{pair}: detected new predictions outlier ({n_outliers=}) on trade {trade.id}"
+                )
+                trade.set_custom_data("n_outliers", n_outliers)
+                trade.set_custom_data("last_outlier_date", last_candle_date.isoformat())
 
         if (
-            entry_tag == "short"
+            trade.trade_direction == "short"
             and last_candle.get("do_predict") == 1
+            and last_candle.get("DI_catch") == 1
             and last_candle.get(EXTREMA_COLUMN) < last_candle.get("minima_threshold")
+            and self.reversal_confirmed(df, pair, "long", "exit", current_rate)
         ):
             return "minima_detected_short"
         if (
-            entry_tag == "long"
+            trade.trade_direction == "long"
             and last_candle.get("do_predict") == 1
+            and last_candle.get("DI_catch") == 1
             and last_candle.get(EXTREMA_COLUMN) > last_candle.get("maxima_threshold")
+            and self.reversal_confirmed(df, pair, "short", "exit", current_rate)
         ):
             return "maxima_detected_long"
 
-        take_profit_distance = self.get_take_profit_distance(df, trade)
-        if isna(take_profit_distance) or take_profit_distance <= 0:
+        trade_exit_stage = QuickAdapterV3.get_trade_exit_stage(trade)
+        if trade_exit_stage in self.partial_exit_stages:
             return None
-        take_profit_price = (
-            trade.open_rate + (-1 if trade.is_short else 1) * take_profit_distance
+
+        trade_take_profit_price = self.get_take_profit_price(
+            df, trade, trade_exit_stage
         )
-        trade.set_custom_data(key="take_profit_price", value=take_profit_price)
-        self.throttle_callback(
-            pair=pair,
-            callback=lambda: logger.info(
-                f"Trade {trade.trade_direction} for {pair}: open price {trade.open_rate}, current price {current_rate}, TP price {take_profit_price}"
-            ),
-            current_time=current_time,
+        if isna(trade_take_profit_price):
+            return None
+        trade_take_profit_exit = QuickAdapterV3.can_take_profit(
+            trade, current_rate, trade_take_profit_price
         )
-        if trade.is_short:
-            if current_rate <= take_profit_price:
-                return "take_profit_short"
+
+        if not trade_take_profit_exit:
+            self.throttle_callback(
+                pair=pair,
+                current_time=current_time,
+                callback=lambda: logger.info(
+                    f"Trade {trade.trade_direction} {trade.pair} stage {trade_exit_stage} | "
+                    f"Take Profit: {format_number(trade_take_profit_price)}, Rate: {format_number(current_rate)}"
+                ),
+            )
+            return None
+
+        trade_unrealized_pnl_history = QuickAdapterV3.get_trade_unrealized_pnl_history(
+            trade
+        )
+        (
+            _,
+            trade_global_pnl_velocity_std,
+            _,
+            trade_global_pnl_acceleration_std,
+            trade_recent_pnl_velocity,
+            trade_recent_pnl_velocity_std,
+            trade_recent_pnl_acceleration,
+            trade_recent_pnl_acceleration_std,
+        ) = QuickAdapterV3.get_pnl_momentum(
+            trade_unrealized_pnl_history, self._pnl_momentum_window_size
+        )
+
+        z_recent_v = QuickAdapterV3._zscore(
+            trade_recent_pnl_velocity, trade_recent_pnl_velocity_std
+        )
+        z_recent_a = QuickAdapterV3._zscore(
+            trade_recent_pnl_acceleration, trade_recent_pnl_acceleration_std
+        )
+
+        trade_hist_len = len(trade_unrealized_pnl_history)
+        trade_exit_thresholds = self._get_exit_thresholds(
+            hist_len=trade_hist_len,
+            std_v_global=trade_global_pnl_velocity_std,
+            std_a_global=trade_global_pnl_acceleration_std,
+            std_v_recent=trade_recent_pnl_velocity_std,
+            std_a_recent=trade_recent_pnl_acceleration_std,
+        )
+        k_decl_v = trade_exit_thresholds.get("k_decl_v")
+        k_decl_a = trade_exit_thresholds.get("k_decl_a")
+
+        decl_checks: list[bool] = []
+        if np.isfinite(z_recent_v):
+            decl_checks.append(z_recent_v <= -k_decl_v)
+        if np.isfinite(z_recent_a):
+            decl_checks.append(z_recent_a <= -k_decl_a)
+        if len(decl_checks) == 0:
+            trade_recent_pnl_declining = True
         else:
-            if current_rate >= take_profit_price:
-                return "take_profit_long"
+            trade_recent_pnl_declining = all(decl_checks)
+
+        trade_exit = trade_take_profit_exit and trade_recent_pnl_declining
+
+        if not trade_exit:
+            self.throttle_callback(
+                pair=pair,
+                current_time=current_time,
+                callback=lambda: logger.info(
+                    f"Trade {trade.trade_direction} {trade.pair} stage {trade_exit_stage} | "
+                    f"Take Profit: {format_number(trade_take_profit_price)}, Rate: {format_number(current_rate)} | "
+                    f"Declining: {trade_recent_pnl_declining} "
+                    f"(zV:{format_number(z_recent_v)}<=-k:{format_number(-k_decl_v)}, zA:{format_number(z_recent_a)}<=-k:{format_number(-k_decl_a)})"
+                ),
+            )
+
+        if trade_exit:
+            return f"take_profit_{trade.trade_direction}_{trade_exit_stage}"
+
+        return None
 
     def confirm_trade_entry(
         self,
@@ -699,17 +1549,19 @@ class QuickAdapterV3(IStrategy):
         amount: float,
         rate: float,
         time_in_force: str,
-        current_time: datetime,
+        current_time: datetime.datetime,
         entry_tag: Optional[str],
         side: str,
         **kwargs,
     ) -> bool:
         if Trade.get_open_trade_count() >= self.config.get("max_open_trades"):
             return False
-        max_open_trades_per_side = self.max_open_trades_per_side()
+        max_open_trades_per_side = self.max_open_trades_per_side
         if max_open_trades_per_side >= 0:
             open_trades = Trade.get_open_trades()
-            trades_per_side = sum(1 for trade in open_trades if trade.enter_tag == side)
+            trades_per_side = sum(
+                1 for trade in open_trades if trade.trade_direction == side
+            )
             if trades_per_side >= max_open_trades_per_side:
                 return False
 
@@ -717,46 +1569,11 @@ class QuickAdapterV3(IStrategy):
             pair=pair, timeframe=self.config.get("timeframe")
         )
         if df.empty:
+            logger.info(f"User denied {side} entry for {pair}: dataframe is empty")
             return False
-        last_candle = df.iloc[-1]
-        last_candle_close = last_candle.get("close")
-        last_candle_high = last_candle.get("high")
-        last_candle_low = last_candle.get("low")
-        last_candle_natr = last_candle.get("natr_label_period_candles")
-        if isna(last_candle_natr) or last_candle_natr < 0:
-            return False
-        lower_bound = 0
-        upper_bound = 0
-        price_deviation = (last_candle_natr / 100.0) * self.get_entry_natr_ratio(pair)
-        if side == "long":
-            lower_bound = last_candle_low * (1 - price_deviation)
-            upper_bound = last_candle_close * (1 + price_deviation)
-        elif side == "short":
-            lower_bound = last_candle_close * (1 - price_deviation)
-            upper_bound = last_candle_high * (1 + price_deviation)
-        if lower_bound < 0:
-            logger.info(
-                f"User denied {side} entry for {pair}: calculated lower bound {lower_bound} is below zero"
-            )
-            return False
-        if lower_bound <= rate <= upper_bound:
+        if self.reversal_confirmed(df, pair, side, "entry", rate):
             return True
-        else:
-            logger.info(
-                f"User denied {side} entry for {pair}: rate {rate} outside bounds [{lower_bound}, {upper_bound}]"
-            )
         return False
-
-    def max_open_trades_per_side(self) -> int:
-        max_open_trades = self.config.get("max_open_trades")
-        if max_open_trades < 0:
-            return -1
-        if self.is_short_allowed():
-            if max_open_trades % 2 == 1:
-                max_open_trades += 1
-            return int(max_open_trades / 2)
-        else:
-            return max_open_trades
 
     def is_short_allowed(self) -> bool:
         trading_mode = self.config.get("trading_mode")
@@ -767,43 +1584,9 @@ class QuickAdapterV3(IStrategy):
         else:
             raise ValueError(f"Invalid trading_mode: {trading_mode}")
 
-    def smooth_extrema(
-        self,
-        series: Series,
-        window: int,
-        std: Optional[float] = None,
-    ) -> Series:
-        extrema_smoothing = self.freqai_info.get("extrema_smoothing", "gaussian")
-        if std is None:
-            std = derive_gaussian_std_from_window(window)
-        gaussian_window = get_gaussian_window(std, True)
-        odd_window = get_odd_window(window)
-        smoothing_methods: dict[str, Series] = {
-            "gaussian": series.rolling(
-                window=gaussian_window,
-                win_type="gaussian",
-                center=True,
-            ).mean(std=std),
-            "zero_phase_gaussian": zero_phase_gaussian(
-                series=series, window=window, std=std
-            ),
-            "boxcar": series.rolling(
-                window=odd_window, win_type="boxcar", center=True
-            ).mean(),
-            "triang": series.rolling(
-                window=odd_window, win_type="triang", center=True
-            ).mean(),
-            "smm": series.rolling(window=odd_window, center=True).median(),
-            "sma": series.rolling(window=odd_window, center=True).mean(),
-            "ewma": series.ewm(span=window).mean(),
-            "zlewma": zlema(series, period=window),
-        }
-        return smoothing_methods.get(
-            extrema_smoothing,
-            smoothing_methods["gaussian"],
-        )
-
-    def optuna_load_best_params(self, pair: str, namespace: str) -> Optional[dict]:
+    def optuna_load_best_params(
+        self, pair: str, namespace: str
+    ) -> Optional[dict[str, Any]]:
         best_params_path = Path(
             self.models_full_path
             / f"optuna-{namespace}-best-params-{pair.split('/')[0]}.json"

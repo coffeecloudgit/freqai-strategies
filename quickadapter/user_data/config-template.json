@@ -3,8 +3,7 @@
   "strategy": "QuickAdapterV3",
   "freqaimodel": "QuickAdapterRegressorV3",
   "db_url": "sqlite:////freqtrade/user_data/freqtrade-quickadapter-tradesv3.sqlite",
-  "logfile": "/freqtrade/user_data/logs/freqtrade-quickadapter.log",
-  "max_open_trades": 10,
+  "max_open_trades": 3,
   "stake_currency": "USDT",
   "stake_amount": "unlimited",
   "tradable_balance_ratio": 0.99,
@@ -12,9 +11,8 @@
   "dry_run": true,
   "dry_run_wallet": 1000,
   "cancel_open_orders_on_exit": false,
-  // "trading_mode": "futures",
-  // "margin_mode": "isolated",
-  "trading_mode": "spot",
+  "trading_mode": "futures",
+  "margin_mode": "isolated",
   "unfilledtimeout": {
     "entry": 10,
     "exit": 10,
@@ -51,36 +49,11 @@
       "enableRateLimit": true,
       "rateLimit": 60
     },
-    // Spot top 5
     "pair_whitelist": [
-      "BTC/USDT",
-      "ETH/USDT",
-      "SOL/USDT",
-      "BNB/USDT",
-      "XRP/USDT"
-    ],
-    // // Spot IA
-    // "pair_whitelist": [
-    //     "NEAR/USDT",
-    //     "ICP/USDT",
-    //     "RENDER/USDT",
-    //     "TAO/USDT",
-    //     "FET/USDT"
-    // ],
-    // // Spot restaking
-    // "pair_whitelist": [
-    //     "PENDLE/USDT",
-    //     "EIGEN/USDT",
-    //     "ETHFI/USDT"
-    // ],
-    // // Spot meme
-    // "pair_whitelist": [
-    //     "DOGE/USDT",
-    //     "SHIB/USDT",
-    //     "PEPE/USDT",
-    //     "BONK/USDT",
-    //     "WIF/USDT",
-    // ],
+      "ETH/USDT:USDT",
+      "SOL/USDT:USDT",
+      "XRP/USDT:USDT"
+    ]
   },
   "pairlists": [
     {
@@ -95,7 +68,7 @@
   "api_server": {
     "enabled": false,
     "listen_ip_address": "0.0.0.0",
-    "listen_port": 8080,
+    "listen_port": 8083,
     "verbosity": "error",
     "enable_openapi": false,
     "jwt_secret_key": "",
@@ -107,26 +80,25 @@
   "freqai": {
     "enabled": true,
     "regressor": "xgboost",
-    // "regressor": "lightgbm",
     "conv_width": 1,
     "purge_old_models": 2,
     "expiration_hours": 24,
     "train_period_days": 60,
-    // "live_retrain_hours": 1,
+    "live_retrain_hours": 1,
     "backtest_period_days": 2,
     "write_metrics_to_disk": false,
-    "identifier": "quickadapter-xgboost",
-    // "identifier": "quickadapter-lightgbm",
+    "identifier": "quickadapter-xgboost-01",
     "fit_live_predictions_candles": 600,
-    "data_kitchen_thread_count": 6, // set to number of CPU threads / 4
+    "data_kitchen_thread_count": 6,
     "track_performance": false,
     "outlier_threshold": 0.999,
     "optuna_hyperopt": {
       "enabled": true,
       "n_jobs": 6,
-      "n_trials": 36,
+      "n_trials": 50,
       "timeout": 7200,
-      "candles_step": 10,
+      "label_candles_step": 1,
+      "train_candles_step": 10,
       "storage": "file"
     },
     "extra_returns_per_train": {
@@ -136,24 +108,28 @@
       "DI_cutoff": 2,
       "&s-minima_threshold": -2,
       "&s-maxima_threshold": 2,
-      "label_period_candles": 100,
-      "label_natr_ratio": 6,
+      "label_period_candles": 24,
+      "label_natr_ratio": 8.0,
       "hp_rmse": -1,
       "train_rmse": -1
     },
     "feature_parameters": {
       "include_corr_pairlist": [
-        "BTC/USDT",
-        "ETH/USDT"
+        "BTC/USDT:USDT",
+        "ETH/USDT:USDT"
       ],
       "include_timeframes": [
         "5m",
         "15m",
         "1h",
-        "4h",
-        // "1d"
+        "4h"      
       ],
-      "label_period_candles": 100,
+      "label_period_candles": 24,
+      "label_metric": "euclidean",
+      "label_weights": [
+        0.5,
+        0.5
+      ],
       "include_shifted_candles": 6,
       "DI_threshold": 10,
       "weight_factor": 0.9,
@@ -177,10 +153,7 @@
       "shuffle": false
     },
     "model_training_parameters": {
-      // "device": "gpu",
-      // "use_rmm:": true,
-      "n_jobs": 6, // set to number of CPU threads / 4
-      "n_estimators": 1000,
+      "n_jobs": 6,
       "verbosity": 1
     }
   },
