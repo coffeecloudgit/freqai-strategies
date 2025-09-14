@@ -154,7 +154,9 @@
     },
     "model_training_parameters": {
       "n_jobs": 6,
-      "verbosity": 1
+      "verbosity": 1,
+      "device": "gpu",
+      "use_rmm:": true
     }
   },
   "bot_name": "freqtrade-quickadapter",
