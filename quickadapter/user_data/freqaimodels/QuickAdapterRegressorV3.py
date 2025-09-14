@@ -1420,7 +1420,7 @@ def label_objective(
         max_label_period_candles,
         step=candles_step,
     )
-    label_natr_ratio = trial.suggest_float("label_natr_ratio", 8.0, 18.0, step=0.01)
+    label_natr_ratio = trial.suggest_float("label_natr_ratio", 8.0, 17.0, step=0.01)
 
     label_period_cycles = fit_live_predictions_candles / label_period_candles
     df = df.iloc[-(max(2, int(label_period_cycles)) * label_period_candles) :]
